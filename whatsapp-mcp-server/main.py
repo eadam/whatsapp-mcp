@@ -5,9 +5,6 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from whatsapp import (
-    download_media as whatsapp_download_media,
-)
-from whatsapp import (
     get_chat as whatsapp_get_chat,
 )
 from whatsapp import (
@@ -36,12 +33,6 @@ from whatsapp import (
 )
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
-)
-from whatsapp import (
-    send_audio_message as whatsapp_audio_voice_message,
-)
-from whatsapp import (
-    send_file as whatsapp_send_file,
 )
 from whatsapp import (
     send_message as whatsapp_send_message,
@@ -302,11 +293,18 @@ def send_message(
     quoted_sender_jid: str = "",
     quoted_content: str = "",
 ) -> dict[str, Any]:
-    """Send a WhatsApp message to a person or group. For group chats use the JID.
+    """Send a WhatsApp text message to a single person.
+
+    NOTE (homelab): the bridge enforces a strict, fail-closed send policy. Only
+    personal recipients on the server-side allowlist can be messaged; group JIDs,
+    @lid, and malformed numbers are rejected. Daily and per-recipient caps apply,
+    and in campaign mode only messages matching the operator-approved manifest are
+    delivered. A blocked send returns success=false with the reason — do not retry
+    or rephrase to evade it.
 
     Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        recipient: A phone number with country code, no + or other symbols
+                 (e.g., "15551234567"). Group JIDs are not permitted.
         message: The message text to send
         quoted_message_id: ID of the message to reply to (optional). When set, the sent
                            message will appear as a quoted reply in WhatsApp.
@@ -329,57 +327,16 @@ def send_message(
     return {"success": success, "message": status_message}
 
 
-@mcp.tool()
-def send_file(recipient: str, media_path: str) -> dict[str, Any]:
-    """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document)
-
-    Returns:
-        A dictionary containing success status and a status message
-    """
-
-    # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
-    return {"success": success, "message": status_message}
-
-
-@mcp.tool()
-def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
-    """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
-
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
-    return {"success": success, "message": status_message}
-
-
-@mcp.tool()
-def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
-    """Download media from a WhatsApp message and get the local file path.
-
-    Args:
-        message_id: The ID of the message containing the media
-        chat_jid: The JID of the chat containing the message
-
-    Returns:
-        A dictionary containing success status, a status message, and the file path if successful
-    """
-    file_path = whatsapp_download_media(message_id, chat_jid)
-
-    if file_path:
-        return {"success": True, "message": "Media downloaded successfully", "file_path": file_path}
-    else:
-        return {"success": False, "message": "Failed to download media"}
+# ── Homelab hardening: media tools intentionally NOT registered ──────────────
+# send_file, send_audio_message, and download_media are deliberately omitted on
+# the eadam/whatsapp-mcp `homelab` branch. They take/return server-local
+# filesystem paths, which are meaningless and leaky over the remote MCP Server
+# Portal transport (the path exists only inside the container, not on the
+# client). The underlying whatsapp_send_file / whatsapp_audio_voice_message /
+# whatsapp_download_media helpers remain in whatsapp.py but are unreachable via
+# MCP. Re-enabling requires a mounted-outbox + authenticated-download design
+# (see the homelab plan "Open items"). Photos from replies are collected
+# manually from the phone / WhatsApp Web.
 
 
 def shutdown_handler(signum, frame):

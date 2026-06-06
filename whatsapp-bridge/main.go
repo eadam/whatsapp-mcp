@@ -46,6 +46,16 @@ var forwardSelfMessages = getEnvBool("FORWARD_SELF", true)
 var fullHistoryPairFlag = flag.Bool("full-history-pair", false,
 	"Request full history at pair time (only effective when re-pairing; no-op for existing sessions)")
 
+// Homelab admin: load an approved campaign manifest and exit. This is the ONLY
+// way an approved (recipient, message) set enters the bridge; it is a separate
+// process invocation (e.g. `docker compose exec`), never reachable through the
+// MCP tool surface, so a prompt-injected agent cannot alter what may be sent.
+// See enforce.go and manifest_admin.go.
+var loadManifestFlag = flag.String("load-manifest", "",
+	"Admin: path to an approved campaign manifest (JSON array of {recipient,message}); loads it and exits. Requires -manifest-campaign.")
+var manifestCampaignFlag = flag.String("manifest-campaign", "",
+	"Admin: campaign_id to bind the loaded manifest to (must match WHATSAPP_CAMPAIGN_ID at send time).")
+
 // getEnvBool reads a boolean env var with a default.
 // Accepts: 1/true/yes/on and 0/false/no/off (case-insensitive)
 func getEnvBool(key string, def bool) bool {
@@ -149,6 +159,16 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	if err := ensureMessageStoreSchema(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	// Homelab send-enforcement tables + crash recovery (see enforce.go).
+	if err := ensureGuardSchema(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := recoverStalePending(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -1819,6 +1839,10 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 	}
 	mux := http.NewServeMux()
 
+	// Homelab send policy, loaded once at startup (see enforce.go).
+	guardCfg := loadGuardConfig()
+	guardCfg.logBanner()
+
 	// Health check endpoint
 	mux.HandleFunc("/api/health", auth(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1885,8 +1909,40 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		fmt.Printf("→ /api/send recipient=%q message_len=%d has_media=%v\n",
 			req.Recipient, len(req.Message), resolvedMediaPath != "")
 
+		// Homelab send enforcement (see enforce.go). This is the single
+		// chokepoint: normalize the recipient to a strict E.164 identity, then
+		// atomically check allowlist + manifest + dedup + caps and reserve a
+		// ledger slot BEFORE the network send. Rejections never reach WhatsApp.
+		canonRecipient, normErr := normalizeRecipient(req.Recipient)
+		if normErr != nil {
+			audit(messageStore.db, guardCfg.campaignID, req.Recipient, "", "reject", "normalize: "+normErr.Error())
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("recipient rejected: %v", normErr),
+			})
+			return
+		}
+		msgHash := messageHash(req.Message, resolvedMediaPath)
+		decision, ledgerID, reason := reserveSend(messageStore.db, guardCfg, canonRecipient, msgHash)
+		switch decision {
+		case decDuplicate:
+			fmt.Printf("← /api/send recipient=%q decision=duplicate-suppressed\n", canonRecipient)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: reason})
+			return
+		case decReject:
+			fmt.Printf("← /api/send recipient=%q decision=reject reason=%q\n", canonRecipient, reason)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "send blocked: " + reason})
+			return
+		}
+
 		// Send the message
 		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent)
+		finalizeSend(messageStore.db, ledgerID, success)
 		fmt.Printf("← /api/send success=%v status=%q\n", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -2074,6 +2130,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 func main() {
 	flag.Parse()
+
+	// Homelab admin mode: load an approved manifest, then exit. Runs without
+	// starting the WhatsApp client, so it can be invoked against a running
+	// bridge container via `docker compose exec`.
+	if *loadManifestFlag != "" {
+		if err := runManifestAdmin(*loadManifestFlag, *manifestCampaignFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "manifest load failed: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 
 	// Set up logger with DEBUG level for more detailed logging
 	logger := waLog.Stdout("Client", "DEBUG", true)
