@@ -2,11 +2,17 @@ import json
 import os
 import os.path
 import sqlite3
+import traceback
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
+from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import requests
+from PIL import Image as PilImage
+from PIL import ImageOps
 
 import audio
 
@@ -45,6 +51,121 @@ def _bridge_headers() -> dict[str, str]:
     if not token:
         return {}
     return {"Authorization": f"Bearer {token}"}
+
+
+# ── Media-download helpers ────────────────────────────────────────────────────
+# NOTE: _normalize_jid MUST be defined before _load_download_allowlist() because
+# the allowlist loader calls it at module-import time.
+
+# Container path where the Go bridge writes downloaded media.
+# Must match messageStore.storeRoot (resolved path of /opt/whatsapp-mcp/whatsapp-bridge/store).
+MEDIA_STORE_BASE = "/opt/whatsapp-mcp/whatsapp-bridge/store"
+
+# Preview generation constraints.
+PREVIEW_MAX_DIM = 1600  # px — longer side capped at this during thumbnail()
+PREVIEW_MAX_BYTES = 1_500_000  # hard ceiling on preview output bytes
+PREVIEW_JPEG_Q = 82  # starting JPEG quality; retried at 65 then 45 if still over cap
+
+# Pillow format → MCP Image format string.
+PILLOW_FORMAT_TO_FMT: dict[str, str] = {
+    "JPEG": "jpeg",
+    "PNG": "png",
+    "GIF": "gif",
+    "WEBP": "webp",
+}
+
+
+def _normalize_jid(raw: str) -> str:
+    """Normalize a raw JID or phone number to canonical '<digits>@s.whatsapp.net' form.
+
+    Mirrors Go's normalizeRecipient():
+    - Strips leading +
+    - Strips :device suffix
+    - Asserts all-digit user part
+    - Asserts length 6–15 digits
+    - Appends @s.whatsapp.net
+
+    Raises ValueError for groups (@g.us), @lid, malformed, or empty inputs.
+    """
+    s = raw.strip()
+    if not s:
+        raise ValueError("empty JID")
+
+    # If already a JID with an explicit server, validate the server first.
+    if "@" in s:
+        user, server = s.split("@", 1)
+        if server.lower() != "s.whatsapp.net":
+            raise ValueError(f"non-personal JID server {server!r} (groups/@lid not allowed)")
+        s = user  # continue normalizing the user part
+
+    # Strip leading + and :device suffix.
+    s = s.lstrip("+")
+    if ":" in s:
+        s = s.split(":")[0]
+
+    if not s:
+        raise ValueError(f"no digits in JID {raw!r}")
+    if not s.isdigit():
+        raise ValueError(f"JID user part is not all-digits: {s!r}")
+    if not (6 <= len(s) <= 15):
+        raise ValueError(f"JID digit count {len(s)} outside valid range 6-15: {s!r}")
+
+    return f"{s}@s.whatsapp.net"
+
+
+def _parse_max_download_bytes() -> int:
+    """Parse WHATSAPP_MAX_DOWNLOAD_BYTES.
+
+    Missing/empty → 5 MiB. "0" → deny all. Negative/invalid → deny all + log.
+    """
+    raw = os.environ.get("WHATSAPP_MAX_DOWNLOAD_BYTES", "").strip()
+    if raw == "":
+        return 5 * 1024 * 1024  # 5 MiB default
+    try:
+        v = int(raw)
+        if v < 0:
+            raise ValueError("negative value")
+        return v  # 0 = deny all
+    except ValueError:
+        print(f"guard: WHATSAPP_MAX_DOWNLOAD_BYTES={raw!r} is invalid; denying all downloads (fail-closed)")
+        return 0
+
+
+# Evaluated once at module load time.
+MEDIA_SIZE_CAP_BYTES: int = _parse_max_download_bytes()
+
+
+def _load_download_allowlist() -> tuple[set[str], bool]:
+    """Parse WHATSAPP_MEDIA_DOWNLOAD_ALLOWED_CHATS.
+
+    Returns (allowed_jids, allow_all).
+    - "*"   → (set(), True)  — allow-all sentinel
+    - empty → (set(), False) — deny all, log warning
+    - else  → (set of canonical JIDs, False)
+    """
+    raw = os.environ.get("WHATSAPP_MEDIA_DOWNLOAD_ALLOWED_CHATS", "").strip()
+    if raw == "*":
+        return (set(), True)
+
+    jids: set[str] = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            jids.add(_normalize_jid(entry))
+        except ValueError as e:
+            print(f"media-download allowlist: skipping {entry!r}: {e}")
+
+    if not jids:
+        print("guard: WARNING media-download allowlist EMPTY — all downloads denied (fail-closed)")
+
+    return (jids, False)
+
+
+MEDIA_DOWNLOAD_ALLOWED_JIDS: set[str]
+MEDIA_DOWNLOAD_ALLOW_ALL: bool
+MEDIA_DOWNLOAD_ALLOWED_JIDS, MEDIA_DOWNLOAD_ALLOW_ALL = _load_download_allowlist()
 
 
 @dataclass
@@ -1130,3 +1251,162 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+def download_media_as_image(message_id: str, chat_jid: str) -> dict[str, Any]:
+    """Download an image from a WhatsApp message and return it as bytes for inline display.
+
+    Implements the full secure receive pipeline:
+    1. JID normalization + allowlist gate (Python-side, before any bridge call)
+    2. Bridge call to /api/download (Go-side confinement, atomic write, size limits)
+    3. Python-side path confinement re-check
+    4. Pillow validation (decompression bomb, format check, dimension check)
+    5. Preview generation: resize to PREVIEW_MAX_DIM px and/or compress to
+       PREVIEW_MAX_BYTES. Animated GIF and WebP that exceed either threshold
+       are flattened to a static JPEG — animation and transparency are lost.
+
+    Returns a dict with:
+    - On success: {"ok": True, "data": bytes, "format": str, "filename": str, "file_size_bytes": int}
+    - On failure: {"code": str, ...optional extra fields}
+
+    Stable error codes (never expose internal paths, tracebacks, or raw exceptions):
+      invalid_jid, not_allowed, media_too_large, bridge_unreachable,
+      path_confinement, not_found, download_failed, invalid_bridge_response,
+      path_resolution_failed, media_file_missing, media_read_failed,
+      decompression_bomb, invalid_image, image_too_large_dimensions,
+      unsupported_format, preview_generation_failed, preview_too_large,
+      internal_error
+    """
+    try:
+        # ── Step 1: Normalize JID ─────────────────────────────────────────────
+        try:
+            normalized_jid = _normalize_jid(chat_jid)
+        except ValueError:
+            return {"code": "invalid_jid"}
+
+        # ── Step 2: Allowlist check ───────────────────────────────────────────
+        if not MEDIA_DOWNLOAD_ALLOW_ALL and normalized_jid not in MEDIA_DOWNLOAD_ALLOWED_JIDS:
+            return {"code": "not_allowed"}
+
+        # ── Step 3: Deny-all fast-path (cap == 0, before any I/O) ────────────
+        if MEDIA_SIZE_CAP_BYTES == 0:
+            return {"code": "media_too_large"}
+
+        # ── Step 4: Bridge call ───────────────────────────────────────────────
+        bridge_url = f"{WHATSAPP_API_BASE_URL}/download"
+        payload = {"message_id": message_id, "chat_jid": normalized_jid}
+        try:
+            resp = requests.post(bridge_url, json=payload, headers=_bridge_headers(), timeout=(5, 60))
+        except requests.RequestException:
+            return {"code": "bridge_unreachable"}
+
+        # ── Step 5: Handle non-200 ────────────────────────────────────────────
+        if resp.status_code != 200:
+            try:
+                code = resp.json().get("code")
+            except Exception:
+                code = None
+            if not code:
+                code = {403: "path_confinement", 404: "not_found"}.get(resp.status_code, "download_failed")
+            return {"code": code}
+
+        # ── Step 6: Parse bridge response ─────────────────────────────────────
+        try:
+            data = resp.json()
+            media_path = data["path"]
+            filename = data["filename"]
+        except Exception:
+            return {"code": "invalid_bridge_response"}
+
+        # ── Step 7: Python-side path confinement re-check ─────────────────────
+        try:
+            real = Path(media_path).resolve()
+        except Exception:
+            return {"code": "path_resolution_failed"}
+        base = Path(MEDIA_STORE_BASE).resolve()
+        if not real.is_relative_to(base):
+            print(f"download_media_as_image: path confinement failed: {real!r} not under {base!r}")
+            return {"code": "path_confinement"}
+
+        # ── Step 8: Stat and size check ───────────────────────────────────────
+        try:
+            file_size = real.stat().st_size
+        except FileNotFoundError:
+            return {"code": "media_file_missing"}
+        except Exception:
+            return {"code": "media_read_failed"}
+        if file_size > MEDIA_SIZE_CAP_BYTES:
+            return {"code": "media_too_large", "file_size_bytes": file_size}
+
+        # ── Step 9: Read bytes ────────────────────────────────────────────────
+        try:
+            image_bytes = real.read_bytes()
+        except Exception:
+            return {"code": "media_read_failed"}
+
+        # ── Step 10: Pillow validation ────────────────────────────────────────
+        # Capture format and size BEFORE calling verify() — verify() invalidates
+        # the decoder state and makes a second open necessary for preview.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", PilImage.DecompressionBombWarning)
+            try:
+                img = PilImage.open(BytesIO(image_bytes))
+                pillow_format = img.format
+                w, h = img.size
+                img.verify()
+            except (PilImage.DecompressionBombWarning, PilImage.DecompressionBombError):
+                return {"code": "decompression_bomb"}
+            except Exception:
+                return {"code": "invalid_image"}
+
+        if w * h > 50_000_000:
+            return {"code": "image_too_large_dimensions"}
+
+        fmt = PILLOW_FORMAT_TO_FMT.get(pillow_format or "")
+        if fmt is None:
+            return {"code": "unsupported_format"}
+
+        # ── Step 11: Preview generation ───────────────────────────────────────
+        # Re-open from bytes (verify() consumed the decoder state).
+        # Animated GIF/WebP that need downscaling are returned as a static JPEG
+        # preview — animation and transparency are not preserved.
+        try:
+            img2 = PilImage.open(BytesIO(image_bytes))
+            img2 = ImageOps.exif_transpose(img2)  # correct EXIF rotation before anything else
+
+            needs_resize = max(w, h) > PREVIEW_MAX_DIM or len(image_bytes) > PREVIEW_MAX_BYTES
+            if needs_resize:
+                img2.thumbnail((PREVIEW_MAX_DIM, PREVIEW_MAX_DIM), PilImage.LANCZOS)
+                # Always output JPEG for resized previews. GIF/WebP → static JPEG
+                # (first frame, transparency flattened to white for RGB modes).
+                if img2.mode not in ("RGB", "L"):
+                    img2 = img2.convert("RGB")
+                buf = BytesIO()
+                for quality in (PREVIEW_JPEG_Q, 65, 45):
+                    buf.seek(0)
+                    buf.truncate()
+                    img2.save(buf, format="JPEG", quality=quality, optimize=True)
+                    if len(buf.getvalue()) <= PREVIEW_MAX_BYTES:
+                        break
+                preview_bytes = buf.getvalue()
+                if len(preview_bytes) > PREVIEW_MAX_BYTES:
+                    return {"code": "preview_too_large"}
+                preview_fmt = "jpeg"
+            else:
+                preview_bytes = image_bytes
+                preview_fmt = fmt
+        except Exception:
+            return {"code": "preview_generation_failed"}
+
+        # ── Step 12: Return ───────────────────────────────────────────────────
+        return {
+            "ok": True,
+            "data": preview_bytes,
+            "format": preview_fmt,
+            "filename": filename,
+            "file_size_bytes": file_size,
+        }
+
+    except Exception:
+        print(f"download_media_as_image: unexpected error:\n{traceback.format_exc()}")
+        return {"code": "internal_error"}

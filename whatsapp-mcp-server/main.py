@@ -2,8 +2,11 @@ import signal
 import sys
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
+from whatsapp import (
+    download_media_as_image as whatsapp_download_media_as_image,
+)
 from whatsapp import (
     get_chat as whatsapp_get_chat,
 )
@@ -327,16 +330,41 @@ def send_message(
     return {"success": success, "message": status_message}
 
 
-# ── Homelab hardening: media tools intentionally NOT registered ──────────────
-# send_file, send_audio_message, and download_media are deliberately omitted on
-# the eadam/whatsapp-mcp `homelab` branch. They take/return server-local
-# filesystem paths, which are meaningless and leaky over the remote MCP Server
-# Portal transport (the path exists only inside the container, not on the
-# client). The underlying whatsapp_send_file / whatsapp_audio_voice_message /
-# whatsapp_download_media helpers remain in whatsapp.py but are unreachable via
-# MCP. Re-enabling requires a mounted-outbox + authenticated-download design
-# (see the homelab plan "Open items"). Photos from replies are collected
-# manually from the phone / WhatsApp Web.
+@mcp.tool()
+def download_media(message_id: str, chat_jid: str) -> Image | str:
+    """Download an image from a WhatsApp message and display it inline.
+
+    Supports JPEG, PNG, GIF, WEBP only. The chat_jid must be on the server-side
+    WHATSAPP_MEDIA_DOWNLOAD_ALLOWED_CHATS allowlist (empty = deny all). Files
+    larger than WHATSAPP_MAX_DOWNLOAD_BYTES (default 5 MiB) are rejected.
+    Large or high-resolution images are returned as a 1600 px JPEG preview;
+    originals are retained in the volume and included in nightly backups.
+    Animated GIF and WebP files that require downscaling are returned as a static
+    JPEG frame — animation and transparency are not preserved in the preview.
+
+    Use list_messages to obtain the message_id and chat_jid for a media message.
+    The chat_jid must be the exact JID stored in the database (e.g. "15551234567@s.whatsapp.net").
+
+    Args:
+        message_id: ID of the WhatsApp message containing the image (from list_messages)
+        chat_jid:   JID of the chat containing the message (e.g. "15551234567@s.whatsapp.net")
+    """
+    result = whatsapp_download_media_as_image(message_id, chat_jid)
+    if result.get("ok"):
+        return Image(data=result["data"], format=result["format"])
+    code = result.get("code", "unknown_error")
+    meta = {k: v for k, v in result.items() if k not in ("ok", "code", "data")}
+    return f"download_media failed: {code}" + (f" {meta}" if meta else "")
+
+
+# ── Homelab hardening: some media tools intentionally NOT registered ──────────
+# send_file and send_audio_message are omitted — they take server-local paths
+# that are meaningless over the remote MCP Server Portal transport.
+# The underlying whatsapp_send_file / whatsapp_audio_voice_message helpers remain
+# in whatsapp.py for potential future use but are unreachable via MCP.
+# download_media (image receive) IS registered above via download_media_as_image,
+# which acts as a base64 adapter: same container → same filesystem → shared store.
+# Phase B (send images) is deferred pending Cowork raw-bytes capability confirmation.
 
 
 def shutdown_handler(signum, frame):

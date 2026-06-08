@@ -85,7 +85,10 @@ type Message struct {
 
 // Database handler for storing message history
 type MessageStore struct {
-	db *sql.DB
+	db        *sql.DB
+	storeRoot string // absolute, EvalSymlinks-resolved path of the "store/" directory;
+	// used exclusively for media download path confinement — do NOT use for
+	// whatsmeow session DB paths (those are controlled by the whatsmeow library).
 }
 
 type ChatEphemeralSettings struct {
@@ -173,7 +176,21 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, err
 	}
 
-	return &MessageStore{db: db}, nil
+	// Resolve storeRoot once at startup so all media download path confinement
+	// checks use a canonical, symlink-free base. EvalSymlinks succeeds here
+	// because MkdirAll("store", ...) above guarantees the directory exists.
+	absStore, absErr := filepath.Abs("store")
+	if absErr != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to resolve store path: %v", absErr)
+	}
+	resolvedStore, evalErr := filepath.EvalSymlinks(absStore)
+	if evalErr != nil {
+		// Shouldn't happen: directory was just created. Fall back to Abs path.
+		resolvedStore = absStore
+	}
+
+	return &MessageStore{db: db, storeRoot: resolvedStore}, nil
 }
 
 func ensureMessageStoreSchema(db *sql.DB) error {
@@ -1959,68 +1976,62 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		})
 	}))
 
-	// Handler for downloading media
+	// Handler for downloading media — hardened image-receive endpoint.
+	// Returns {"path": ..., "filename": ...} on 200, {"code": ...} on any error.
+	// Internal error detail is logged server-side only and never echoed to callers.
 	mux.HandleFunc("/api/download", auth(func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		// Check if connected
-		if !client.IsConnected() {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(DownloadMediaResponse{
-				Success: false,
-				Message: "WhatsApp client is not connected. Please wait for reconnection.",
-			})
-			return
-		}
-
-		// Parse the request body
 		var req DownloadMediaRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
 			return
 		}
-
-		// Validate request
 		if req.MessageID == "" || req.ChatJID == "" {
 			http.Error(w, "Message ID and Chat JID are required", http.StatusBadRequest)
 			return
 		}
 
-		// Log download request for debugging
-		fmt.Printf("📥 Download request: message_id=%s chat_jid=%s\n", req.MessageID, req.ChatJID)
+		fmt.Printf("📥 /api/download message_id=%s chat_jid=%s\n", req.MessageID, req.ChatJID)
 
-		// Download the media
-		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
-
-		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
-		// Handle download result
-		if !success || err != nil {
-			errMsg := "Unknown error"
-			if err != nil {
-				errMsg = err.Error()
+		// ── Allowlist check ─────────────────────────────────────────────────
+		// Normalize the incoming JID and verify it is on the media-download
+		// allowlist. This mirrors the send-path discipline: fail-closed when
+		// the list is empty. Allow-all (*) skips the per-JID lookup.
+		if !guardCfg.mediaDownloadAllowAll {
+			canonJID, normErr := normalizeRecipient(req.ChatJID)
+			if normErr != nil || !guardCfg.mediaDownloadAllowed[canonJID] {
+				fmt.Printf("📥 /api/download rejected (not on allowlist): chat_jid=%s\n", req.ChatJID)
+				w.WriteHeader(http.StatusForbidden)
+				_ = json.NewEncoder(w).Encode(map[string]string{"code": "not_allowed"})
+				return
 			}
+		}
 
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(DownloadMediaResponse{
-				Success: false,
-				Message: fmt.Sprintf("Failed to download media: %s", errMsg),
-			})
+		// ── Connected check ─────────────────────────────────────────────────
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"code": "client_disconnected"})
 			return
 		}
 
-		// Send successful response
-		_ = json.NewEncoder(w).Encode(DownloadMediaResponse{
-			Success:  true,
-			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
-			Filename: filename,
-			Path:     path,
+		// ── Hardened download ───────────────────────────────────────────────
+		result, mediaErr := downloadMediaForAPI(client, messageStore, req.MessageID, req.ChatJID, guardCfg.maxDownloadBytes)
+		if mediaErr != nil {
+			w.WriteHeader(mediaErr.StatusCode)
+			_ = json.NewEncoder(w).Encode(map[string]string{"code": mediaErr.Code})
+			return
+		}
+
+		fmt.Printf("📥 /api/download ✅ message_id=%s -> %s\n", req.MessageID, result.Filename)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"path":     result.Path,
+			"filename": result.Filename,
 		})
 	}))
 

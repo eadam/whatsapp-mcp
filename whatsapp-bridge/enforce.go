@@ -48,12 +48,18 @@ import (
 // reservation — never across the network send.
 var sendMu sync.Mutex
 
-// guardConfig is the static, env-derived send policy, loaded once at startup.
+// guardConfig is the static, env-derived send + media-download policy, loaded once at startup.
 type guardConfig struct {
+	// ── Send policy (WHATSAPP_ALLOWED_RECIPIENTS, caps, campaign) ───────────
 	allowed     map[string]bool // canonical "<digits>@s.whatsapp.net"
 	campaignID  string          // "" = ad-hoc mode (no manifest binding, no dedup)
 	maxPerDay   int
 	maxPerRecip int
+
+	// ── Media-download policy (WHATSAPP_MEDIA_DOWNLOAD_ALLOWED_CHATS) ───────
+	mediaDownloadAllowed  map[string]bool // canonical "<digits>@s.whatsapp.net"
+	mediaDownloadAllowAll bool            // true when env var is exactly "*"
+	maxDownloadBytes      int64           // 0 = deny all; from parseMaxDownloadBytes()
 }
 
 // guardDecision is the outcome of a reservation attempt.
@@ -77,15 +83,19 @@ func getEnvInt(key string, def int) int {
 	return n
 }
 
-// loadGuardConfig reads the policy from the environment. Malformed allowlist
-// entries are skipped with a warning rather than crashing the bridge.
+// loadGuardConfig reads the send + media-download policy from the environment.
+// Malformed allowlist entries are skipped with a warning rather than crashing.
 func loadGuardConfig() guardConfig {
 	cfg := guardConfig{
-		allowed:     map[string]bool{},
-		campaignID:  strings.TrimSpace(os.Getenv("WHATSAPP_CAMPAIGN_ID")),
-		maxPerDay:   getEnvInt("WHATSAPP_MAX_SENDS_PER_DAY", 5),
-		maxPerRecip: getEnvInt("WHATSAPP_MAX_PER_RECIPIENT_PER_DAY", 1),
+		allowed:              map[string]bool{},
+		campaignID:           strings.TrimSpace(os.Getenv("WHATSAPP_CAMPAIGN_ID")),
+		maxPerDay:            getEnvInt("WHATSAPP_MAX_SENDS_PER_DAY", 5),
+		maxPerRecip:          getEnvInt("WHATSAPP_MAX_PER_RECIPIENT_PER_DAY", 1),
+		mediaDownloadAllowed: map[string]bool{},
+		maxDownloadBytes:     parseMaxDownloadBytes(), // defined in media_download.go
 	}
+
+	// Send allowlist.
 	for _, raw := range strings.Split(os.Getenv("WHATSAPP_ALLOWED_RECIPIENTS"), ",") {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
@@ -98,6 +108,32 @@ func loadGuardConfig() guardConfig {
 		}
 		cfg.allowed[canon] = true
 	}
+
+	// Media-download allowlist (WHATSAPP_MEDIA_DOWNLOAD_ALLOWED_CHATS).
+	// "*"   → allow-all sentinel (downloads from any JID are permitted).
+	// empty → deny all (fail-closed; no-op without explicit opt-in).
+	rawMedia := strings.TrimSpace(os.Getenv("WHATSAPP_MEDIA_DOWNLOAD_ALLOWED_CHATS"))
+	if rawMedia == "*" {
+		cfg.mediaDownloadAllowAll = true
+	} else {
+		for _, raw := range strings.Split(rawMedia, ",") {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				continue
+			}
+			canon, err := normalizeRecipient(raw)
+			if err != nil {
+				fmt.Printf("guard: skipping invalid media-download allowlist entry %q: %v\n", raw, err)
+				continue
+			}
+			cfg.mediaDownloadAllowed[canon] = true
+		}
+		// Only warn when the var is explicitly set but parsed to nothing.
+		if rawMedia != "" && len(cfg.mediaDownloadAllowed) == 0 {
+			fmt.Printf("guard: WARNING media-download allowlist parsed to EMPTY — all downloads denied\n")
+		}
+	}
+
 	return cfg
 }
 
@@ -110,6 +146,17 @@ func (c guardConfig) logBanner() {
 		mode, len(c.allowed), c.maxPerDay, c.maxPerRecip)
 	if len(c.allowed) == 0 {
 		fmt.Printf("guard: WARNING allowlist is EMPTY — all sends will be denied (fail-closed)\n")
+	}
+
+	// Media-download policy banner.
+	if c.mediaDownloadAllowAll {
+		fmt.Printf("guard: media-download allowlist=ALLOW-ALL max-bytes=%d\n", c.maxDownloadBytes)
+	} else {
+		fmt.Printf("guard: media-download allowlist=%d JID(s) max-bytes=%d\n",
+			len(c.mediaDownloadAllowed), c.maxDownloadBytes)
+		if len(c.mediaDownloadAllowed) == 0 {
+			fmt.Printf("guard: WARNING media-download allowlist is EMPTY — all downloads denied (fail-closed)\n")
+		}
 	}
 }
 
