@@ -9,7 +9,7 @@ import (
 
 // ── Helper: minimal MessageStore backed by a temp SQLite DB ──────────────────
 
-func newTestMessageStore(t *testing.T) (*MessageStore, string) {
+func newMediaTestStore(t *testing.T) (*MessageStore, string) {
 	t.Helper()
 	dir := t.TempDir()
 
@@ -103,7 +103,7 @@ func TestIdentifierRe_Rejected(t *testing.T) {
 // ── Input validation tests ────────────────────────────────────────────────────
 
 func TestPathConfinement_DotDot(t *testing.T) {
-	store, _ := newTestMessageStore(t)
+	store, _ := newMediaTestStore(t)
 	// ".." passes identifierRe (two dots), but the filepath.Clean check rejects it.
 	_, mErr := downloadMediaForAPI(nil, store, "..", "15551234567@s.whatsapp.net", 5*1024*1024)
 	if mErr == nil || mErr.Code != "path_confinement" {
@@ -112,7 +112,7 @@ func TestPathConfinement_DotDot(t *testing.T) {
 }
 
 func TestPathConfinement_SlashInID(t *testing.T) {
-	store, _ := newTestMessageStore(t)
+	store, _ := newMediaTestStore(t)
 	// "/" is not in identifierRe, so this should also return path_confinement.
 	_, mErr := downloadMediaForAPI(nil, store, "../../etc/passwd", "15551234567@s.whatsapp.net", 5*1024*1024)
 	if mErr == nil || mErr.Code != "path_confinement" {
@@ -123,7 +123,7 @@ func TestPathConfinement_SlashInID(t *testing.T) {
 // ── DB not-found / non-image tests ───────────────────────────────────────────
 
 func TestNotFound_NoMessageRow(t *testing.T) {
-	store, _ := newTestMessageStore(t)
+	store, _ := newMediaTestStore(t)
 	_, mErr := downloadMediaForAPI(nil, store, "NONEXISTENT", "15551234567@s.whatsapp.net", 5*1024*1024)
 	if mErr == nil || mErr.Code != "not_found" {
 		t.Errorf("expected not_found, got %v", mErr)
@@ -131,7 +131,7 @@ func TestNotFound_NoMessageRow(t *testing.T) {
 }
 
 func TestNonImageRejected(t *testing.T) {
-	store, _ := newTestMessageStore(t)
+	store, _ := newMediaTestStore(t)
 	insertTestMessage(t, store, "vid001", "15551234567@s.whatsapp.net", "video", 1000, "http://example.com", []byte("key"))
 	_, mErr := downloadMediaForAPI(nil, store, "vid001", "15551234567@s.whatsapp.net", 5*1024*1024)
 	if mErr == nil || mErr.Code != "unsupported_media_type" {
@@ -142,7 +142,7 @@ func TestNonImageRejected(t *testing.T) {
 // ── Size limit tests ──────────────────────────────────────────────────────────
 
 func TestMediaTooLarge_ZeroCap(t *testing.T) {
-	store, _ := newTestMessageStore(t)
+	store, _ := newMediaTestStore(t)
 	insertTestMessage(t, store, "img001", "15551234567@s.whatsapp.net", "image", 100, "http://example.com", []byte("key"))
 	_, mErr := downloadMediaForAPI(nil, store, "img001", "15551234567@s.whatsapp.net", 0)
 	if mErr == nil || mErr.Code != "media_too_large" {
@@ -151,7 +151,7 @@ func TestMediaTooLarge_ZeroCap(t *testing.T) {
 }
 
 func TestMediaTooLarge_AdvisoryPrecheck(t *testing.T) {
-	store, _ := newTestMessageStore(t)
+	store, _ := newMediaTestStore(t)
 	insertTestMessage(t, store, "img002", "15551234567@s.whatsapp.net", "image", 1000000, "http://example.com", []byte("key"))
 	// Cap is 100 bytes; file_length=1MB should trigger advisory precheck.
 	_, mErr := downloadMediaForAPI(nil, store, "img002", "15551234567@s.whatsapp.net", 100)
@@ -163,7 +163,7 @@ func TestMediaTooLarge_AdvisoryPrecheck(t *testing.T) {
 // ── Cached file confinement tests ─────────────────────────────────────────────
 
 func TestCachedSymlinkRejected(t *testing.T) {
-	store, storeRoot := newTestMessageStore(t)
+	store, storeRoot := newMediaTestStore(t)
 
 	const chatJID = "15551234567@s.whatsapp.net"
 	const msgID = "cachedSym01"
