@@ -331,7 +331,7 @@ def send_message(
 
 
 @mcp.tool()
-def download_media(message_id: str, chat_jid: str) -> Image | str:
+def download_media(message_id: str, chat_jid: str):
     """Download an image from a WhatsApp message and display it inline.
 
     Supports JPEG, PNG, GIF, WEBP only. The chat_jid must be on the server-side
