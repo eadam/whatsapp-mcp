@@ -1,7 +1,10 @@
+import base64
+import errno
 import json
 import os
 import os.path
 import sqlite3
+import stat
 import traceback
 import warnings
 from dataclasses import dataclass
@@ -133,6 +136,30 @@ def _parse_max_download_bytes() -> int:
 
 # Evaluated once at module load time.
 MEDIA_SIZE_CAP_BYTES: int = _parse_max_download_bytes()
+
+
+def _parse_max_export_bytes() -> int:
+    """Parse WHATSAPP_MAX_EXPORT_BYTES (raw bytes, for export_media).
+
+    Missing/empty/"0"/invalid/negative → 0 = export disabled (fail-closed).
+    """
+    raw = os.environ.get("WHATSAPP_MAX_EXPORT_BYTES", "").strip()
+    if raw == "":
+        return 0
+    try:
+        v = int(raw)
+        if v < 0:
+            raise ValueError("negative value")
+        return v
+    except ValueError:
+        print(f"guard: WHATSAPP_MAX_EXPORT_BYTES={raw!r} is invalid; export disabled (fail-closed)")
+        return 0
+
+
+# The effective export cap can never exceed the download cap. If download is
+# disabled (cap 0) export is implicitly disabled too.
+MEDIA_EXPORT_MAX_BYTES: int = _parse_max_export_bytes()
+EXPORT_EFFECTIVE_CAP: int = min(MEDIA_EXPORT_MAX_BYTES, MEDIA_SIZE_CAP_BYTES)
 
 
 def _load_download_allowlist() -> tuple[set[str], bool]:
@@ -1253,6 +1280,179 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
         return None
 
 
+# ── Shared media fetch + validation helpers (used by preview AND export) ──────
+
+# Bridge /api/download error codes we recognise; anything else → download_failed
+# so the "stable codes only" contract holds even if the bridge adds new codes.
+_KNOWN_BRIDGE_DOWNLOAD_CODES = frozenset(
+    {"unsupported_media_type", "media_too_large", "not_found", "path_confinement", "download_failed"}
+)
+
+_FMT_TO_EXT = {"jpeg": ".jpg", "png": ".png", "gif": ".gif", "webp": ".webp"}
+_FMT_TO_MIME = {"jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
+
+
+def _path_has_prefix(child: str, parent: str) -> bool:
+    """True when child == parent or a strict descendant. Python twin of Go's pathHasPrefix.
+
+    Uses os.path.commonpath so "/a/bee" does not match parent "/a/b".
+    """
+    try:
+        return os.path.commonpath([child, parent]) == parent
+    except ValueError:
+        # Mixed absolute/relative or different drives → not confined.
+        return False
+
+
+def _fd_realpath(fd: int) -> str | None:
+    """Resolve the real path of an OPEN descriptor (portable: Linux /proc, macOS F_GETPATH)."""
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}")  # Linux (the container)
+    except OSError:
+        pass
+    try:
+        import fcntl  # macOS / BSD (used by the test host)
+
+        f_getpath = getattr(fcntl, "F_GETPATH", 50)
+        buf = fcntl.fcntl(fd, f_getpath, b"\0" * 1024)
+        return buf.rstrip(b"\0").decode()
+    except Exception:
+        return None
+
+
+def _safe_media_filename(message_id: str, fmt: str) -> str:
+    """Derive a safe filename + correct extension from the DETECTED format.
+
+    Do NOT trust the bridge filename — it hardcodes .jpg regardless of real format.
+    """
+    safe = "".join(c for c in message_id if c.isalnum() or c in ("-", "_"))[:64] or "image"
+    return f"{safe}{_FMT_TO_EXT.get(fmt, '.bin')}"
+
+
+def _validate_image_bytes(image_bytes: bytes) -> tuple[str, int, int] | dict[str, str]:
+    """Pillow validation gate shared by preview + export.
+
+    Returns (fmt, width, height) on success, or an error dict with a stable code.
+    Captures format/size BEFORE verify() (which invalidates decoder state).
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", PilImage.DecompressionBombWarning)
+        try:
+            img = PilImage.open(BytesIO(image_bytes))
+            pillow_format = img.format
+            w, h = img.size
+            img.verify()
+        except (PilImage.DecompressionBombWarning, PilImage.DecompressionBombError):
+            return {"code": "decompression_bomb"}
+        except Exception:
+            return {"code": "invalid_image"}
+
+    if w * h > 50_000_000:
+        return {"code": "image_too_large_dimensions"}
+
+    fmt = PILLOW_FORMAT_TO_FMT.get(pillow_format or "")
+    if fmt is None:
+        return {"code": "unsupported_format"}
+    return (fmt, w, h)
+
+
+def _fetch_confined_media_bytes(message_id: str, chat_jid: str, cap: int) -> dict[str, Any]:
+    """Fetch the ORIGINAL bytes of a received media file — confined + size-bounded.
+
+    Shared by download_media_as_image (preview) and export_media_as_base64.
+    Gates the SOURCE chat via the download allowlist, calls the bridge, then does a
+    symlink-safe, TOCTOU-safe, bounded read through the opened descriptor.
+
+    Returns {"ok": True, "data": bytes, "file_size_bytes": int} or {"code": str}.
+    Never leaks a path or traceback.
+    """
+    # Normalize + source-chat allowlist.
+    try:
+        normalized_jid = _normalize_jid(chat_jid)
+    except ValueError:
+        return {"code": "invalid_jid"}
+    if not MEDIA_DOWNLOAD_ALLOW_ALL and normalized_jid not in MEDIA_DOWNLOAD_ALLOWED_JIDS:
+        return {"code": "not_allowed"}
+    if cap <= 0:
+        return {"code": "media_too_large"}
+
+    # Bridge call.
+    bridge_url = f"{WHATSAPP_API_BASE_URL}/download"
+    payload = {"message_id": message_id, "chat_jid": normalized_jid}
+    try:
+        resp = requests.post(bridge_url, json=payload, headers=_bridge_headers(), timeout=(5, 60))
+    except requests.RequestException:
+        return {"code": "bridge_unreachable"}
+
+    if resp.status_code != 200:
+        code = None
+        try:
+            code = resp.json().get("code")
+        except Exception:
+            code = None
+        if code not in _KNOWN_BRIDGE_DOWNLOAD_CODES:
+            code = {403: "path_confinement", 404: "not_found"}.get(resp.status_code, "download_failed")
+        return {"code": code}
+
+    try:
+        media_path = resp.json()["path"]
+    except Exception:
+        return {"code": "invalid_bridge_response"}
+
+    # Symlink-safe, TOCTOU-safe, bounded read.
+    base = str(Path(MEDIA_STORE_BASE).resolve())
+    fd = None
+    try:
+        try:
+            # O_NOFOLLOW rejects a final-component symlink. Open the ORIGINAL bridge
+            # path (resolving first would strip the symlink and defeat O_NOFOLLOW).
+            fd = os.open(media_path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                return {"code": "media_file_missing"}
+            # ELOOP (symlink) and anything else → confinement, no detail leaked.
+            return {"code": "path_confinement"}
+
+        # Confine the OPENED descriptor (catches intermediate-dir symlinks O_NOFOLLOW misses).
+        real = _fd_realpath(fd)
+        if real is None:
+            return {"code": "media_read_failed"}
+        if not _path_has_prefix(real, base):
+            print("_fetch_confined_media_bytes: confinement failed (resolved path not under store root)")
+            return {"code": "path_confinement"}
+
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            return {"code": "media_read_failed"}
+        if not stat.S_ISREG(st.st_mode):
+            return {"code": "path_confinement"}
+
+        # Bounded, looped read until EOF or cap+1 bytes (os.read may short-read).
+        chunks: list[bytes] = []
+        remaining = cap + 1
+        while remaining > 0:
+            try:
+                chunk = os.read(fd, min(remaining, 1 << 20))
+            except OSError:
+                return {"code": "media_read_failed"}
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    if len(data) > cap:
+        return {"code": "media_too_large", "file_size_bytes": len(data)}
+    return {"ok": True, "data": data, "file_size_bytes": len(data)}
+
+
 def download_media_as_image(message_id: str, chat_jid: str) -> dict[str, Any]:
     """Download an image from a WhatsApp message and return it as bytes for inline display.
 
@@ -1278,98 +1478,23 @@ def download_media_as_image(message_id: str, chat_jid: str) -> dict[str, Any]:
       internal_error
     """
     try:
-        # ── Step 1: Normalize JID ─────────────────────────────────────────────
-        try:
-            normalized_jid = _normalize_jid(chat_jid)
-        except ValueError:
-            return {"code": "invalid_jid"}
+        # ── Fetch original confined bytes (normalize + allowlist + bounded read) ──
+        fetched = _fetch_confined_media_bytes(message_id, chat_jid, MEDIA_SIZE_CAP_BYTES)
+        if not fetched.get("ok"):
+            return fetched
+        image_bytes = fetched["data"]
+        file_size = fetched["file_size_bytes"]
 
-        # ── Step 2: Allowlist check ───────────────────────────────────────────
-        if not MEDIA_DOWNLOAD_ALLOW_ALL and normalized_jid not in MEDIA_DOWNLOAD_ALLOWED_JIDS:
-            return {"code": "not_allowed"}
+        # ── Validate (shared Pillow gate) ─────────────────────────────────────
+        validated = _validate_image_bytes(image_bytes)
+        if isinstance(validated, dict):
+            return validated
+        fmt, w, h = validated
 
-        # ── Step 3: Deny-all fast-path (cap == 0, before any I/O) ────────────
-        if MEDIA_SIZE_CAP_BYTES == 0:
-            return {"code": "media_too_large"}
-
-        # ── Step 4: Bridge call ───────────────────────────────────────────────
-        bridge_url = f"{WHATSAPP_API_BASE_URL}/download"
-        payload = {"message_id": message_id, "chat_jid": normalized_jid}
-        try:
-            resp = requests.post(bridge_url, json=payload, headers=_bridge_headers(), timeout=(5, 60))
-        except requests.RequestException:
-            return {"code": "bridge_unreachable"}
-
-        # ── Step 5: Handle non-200 ────────────────────────────────────────────
-        if resp.status_code != 200:
-            try:
-                code = resp.json().get("code")
-            except Exception:
-                code = None
-            if not code:
-                code = {403: "path_confinement", 404: "not_found"}.get(resp.status_code, "download_failed")
-            return {"code": code}
-
-        # ── Step 6: Parse bridge response ─────────────────────────────────────
-        try:
-            data = resp.json()
-            media_path = data["path"]
-            filename = data["filename"]
-        except Exception:
-            return {"code": "invalid_bridge_response"}
-
-        # ── Step 7: Python-side path confinement re-check ─────────────────────
-        try:
-            real = Path(media_path).resolve()
-        except Exception:
-            return {"code": "path_resolution_failed"}
-        base = Path(MEDIA_STORE_BASE).resolve()
-        if not real.is_relative_to(base):
-            print(f"download_media_as_image: path confinement failed: {real!r} not under {base!r}")
-            return {"code": "path_confinement"}
-
-        # ── Step 8: Stat and size check ───────────────────────────────────────
-        try:
-            file_size = real.stat().st_size
-        except FileNotFoundError:
-            return {"code": "media_file_missing"}
-        except Exception:
-            return {"code": "media_read_failed"}
-        if file_size > MEDIA_SIZE_CAP_BYTES:
-            return {"code": "media_too_large", "file_size_bytes": file_size}
-
-        # ── Step 9: Read bytes ────────────────────────────────────────────────
-        try:
-            image_bytes = real.read_bytes()
-        except Exception:
-            return {"code": "media_read_failed"}
-
-        # ── Step 10: Pillow validation ────────────────────────────────────────
-        # Capture format and size BEFORE calling verify() — verify() invalidates
-        # the decoder state and makes a second open necessary for preview.
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", PilImage.DecompressionBombWarning)
-            try:
-                img = PilImage.open(BytesIO(image_bytes))
-                pillow_format = img.format
-                w, h = img.size
-                img.verify()
-            except (PilImage.DecompressionBombWarning, PilImage.DecompressionBombError):
-                return {"code": "decompression_bomb"}
-            except Exception:
-                return {"code": "invalid_image"}
-
-        if w * h > 50_000_000:
-            return {"code": "image_too_large_dimensions"}
-
-        fmt = PILLOW_FORMAT_TO_FMT.get(pillow_format or "")
-        if fmt is None:
-            return {"code": "unsupported_format"}
-
-        # ── Step 11: Preview generation ───────────────────────────────────────
-        # Re-open from bytes (verify() consumed the decoder state).
-        # Animated GIF/WebP that need downscaling are returned as a static JPEG
-        # preview — animation and transparency are not preserved.
+        # ── Preview generation ────────────────────────────────────────────────
+        # Re-open from bytes (verify() consumed the decoder state). Animated
+        # GIF/WebP that need downscaling are returned as a static JPEG preview —
+        # animation and transparency are not preserved.
         try:
             img2 = PilImage.open(BytesIO(image_bytes))
             img2 = ImageOps.exif_transpose(img2)  # correct EXIF rotation before anything else
@@ -1398,15 +1523,60 @@ def download_media_as_image(message_id: str, chat_jid: str) -> dict[str, Any]:
         except Exception:
             return {"code": "preview_generation_failed"}
 
-        # ── Step 12: Return ───────────────────────────────────────────────────
         return {
             "ok": True,
             "data": preview_bytes,
             "format": preview_fmt,
-            "filename": filename,
+            "filename": _safe_media_filename(message_id, preview_fmt),
             "file_size_bytes": file_size,
         }
 
     except Exception:
         print(f"download_media_as_image: unexpected error:\n{traceback.format_exc()}")
+        return {"code": "internal_error"}
+
+
+def export_media_as_base64(message_id: str, chat_jid: str) -> dict[str, Any]:
+    """Export a received image's ORIGINAL bytes as base64 (for piping to other tools).
+
+    Unlike download_media_as_image (which returns a downscaled inline preview), this
+    returns the original file bytes base64-encoded, so a client can decode and
+    re-transmit/upload them (e.g. to Google Drive). The bytes are NOT re-encoded —
+    verify() does not mutate them — so the export is bit-identical to what was received.
+
+    Gating: source chat must be on the download allowlist; size is bounded by the
+    effective export cap = min(WHATSAPP_MAX_EXPORT_BYTES, WHATSAPP_MAX_DOWNLOAD_BYTES).
+    Export is disabled (fail-closed) until WHATSAPP_MAX_EXPORT_BYTES is set > 0.
+
+    Returns {"ok": True, "data_base64", "format", "mime_type", "filename", "file_size_bytes"}
+    or {"code": <stable error code>}. Never leaks a path or traceback.
+    """
+    try:
+        # Disabled fast-path BEFORE the helper — a zero cap would otherwise surface
+        # as media_too_large, the wrong code.
+        if EXPORT_EFFECTIVE_CAP <= 0:
+            return {"code": "export_disabled"}
+
+        fetched = _fetch_confined_media_bytes(message_id, chat_jid, EXPORT_EFFECTIVE_CAP)
+        if not fetched.get("ok"):
+            return fetched
+        image_bytes = fetched["data"]
+        file_size = fetched["file_size_bytes"]
+
+        validated = _validate_image_bytes(image_bytes)
+        if isinstance(validated, dict):
+            return validated
+        fmt, _w, _h = validated
+
+        return {
+            "ok": True,
+            "data_base64": base64.b64encode(image_bytes).decode("ascii"),
+            "format": fmt,
+            "mime_type": _FMT_TO_MIME.get(fmt, "application/octet-stream"),
+            "filename": _safe_media_filename(message_id, fmt),
+            "file_size_bytes": file_size,
+        }
+
+    except Exception:
+        print(f"export_media_as_base64: unexpected error:\n{traceback.format_exc()}")
         return {"code": "internal_error"}

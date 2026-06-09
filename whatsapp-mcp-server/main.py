@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import random
 import signal
 import sys
 from typing import Any
@@ -6,6 +9,9 @@ from mcp.server.fastmcp import FastMCP, Image
 
 from whatsapp import (
     download_media_as_image as whatsapp_download_media_as_image,
+)
+from whatsapp import (
+    export_media_as_base64 as whatsapp_export_media_as_base64,
 )
 from whatsapp import (
     get_chat as whatsapp_get_chat,
@@ -357,14 +363,68 @@ def download_media(message_id: str, chat_jid: str):
     return f"download_media failed: {code}" + (f" {meta}" if meta else "")
 
 
+@mcp.tool(structured_output=False)
+def export_media(message_id: str, chat_jid: str) -> dict[str, Any]:
+    """Export a received WhatsApp image as base64 text, for piping to OTHER tools.
+
+    download_media gives you an inline preview you can *see* but not re-transmit.
+    export_media instead returns the ORIGINAL image bytes as a base64 string, so you can
+    decode and forward/upload them — e.g. upload a received photo to Google Drive.
+
+    Image-only (JPEG/PNG/GIF/WEBP). The chat_jid must be on the server-side
+    WHATSAPP_MEDIA_DOWNLOAD_ALLOWED_CHATS allowlist. Size is bounded by the effective
+    export cap = min(WHATSAPP_MAX_EXPORT_BYTES, WHATSAPP_MAX_DOWNLOAD_BYTES); export is
+    DISABLED (returns code "export_disabled") until WHATSAPP_MAX_EXPORT_BYTES is set > 0.
+    The bytes are bit-identical to what was received (not re-encoded).
+
+    Args:
+        message_id: ID of the WhatsApp message containing the image (from list_messages)
+        chat_jid:   JID of the chat (e.g. "15551234567@s.whatsapp.net")
+
+    Returns a dict:
+      success → {"ok": True, "data_base64", "format", "mime_type", "filename", "file_size_bytes"}
+      failure → {"code": <stable error code>}  (never a path or traceback)
+    """
+    return whatsapp_export_media_as_base64(message_id, chat_jid)
+
+
+# ── TEMPORARY diagnostic — REMOVE after the Step 0 transport ceiling is measured ──
+# Measures the largest base64 tool-result that survives the Cowork → portal path
+# end-to-end. Returns DETERMINISTIC PSEUDORANDOM (incompressible) bytes so proxy gzip
+# can't inflate the apparent ceiling. Capped at 8192 KiB raw.
+@mcp.tool(structured_output=False)
+def __debug_echo_base64(n_kib: int) -> dict[str, Any]:
+    """TEMPORARY: return a base64 blob of n_kib raw KiB plus its sha256, for transport sizing.
+
+    n_kib is RAW bytes before base64 (1 KiB = 1024 bytes); hard max 8192 (8 MiB raw).
+    Hash the decoded bytes on your side and after a Drive round-trip to confirm integrity.
+
+    Args:
+        n_kib: number of raw KiB to generate (1..8192)
+    """
+    if not isinstance(n_kib, int) or n_kib <= 0:
+        return {"code": "bad_request"}
+    if n_kib > 8192:
+        return {"code": "too_large", "max_kib": 8192}
+    raw = random.Random(1234).randbytes(n_kib * 1024)
+    return {
+        "ok": True,
+        "n_kib": n_kib,
+        "raw_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "data_base64": base64.b64encode(raw).decode("ascii"),
+    }
+
+
 # ── Homelab hardening: some media tools intentionally NOT registered ──────────
 # send_file and send_audio_message are omitted — they take server-local paths
 # that are meaningless over the remote MCP Server Portal transport.
 # The underlying whatsapp_send_file / whatsapp_audio_voice_message helpers remain
 # in whatsapp.py for potential future use but are unreachable via MCP.
-# download_media (image receive) IS registered above via download_media_as_image,
-# which acts as a base64 adapter: same container → same filesystem → shared store.
-# Phase B (send images) is deferred pending Cowork raw-bytes capability confirmation.
+# download_media (image receive) and export_media (base64 export for piping to other
+# tools) ARE registered above. __debug_echo_base64 is a TEMPORARY transport probe to
+# be removed once the Cowork base64 ceiling is measured (Step 0).
+# Phase B (send images) is deferred — see the homelab plan.
 
 
 def shutdown_handler(signum, frame):
