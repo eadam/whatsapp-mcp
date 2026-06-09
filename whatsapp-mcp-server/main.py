@@ -1,6 +1,3 @@
-import base64
-import hashlib
-import random
 import signal
 import sys
 from typing import Any
@@ -388,42 +385,13 @@ def export_media(message_id: str, chat_jid: str) -> dict[str, Any]:
     return whatsapp_export_media_as_base64(message_id, chat_jid)
 
 
-# ── TEMPORARY diagnostic — REMOVE after the Step 0 transport ceiling is measured ──
-# Measures the largest base64 tool-result that survives the Cowork → portal path
-# end-to-end. Returns DETERMINISTIC PSEUDORANDOM (incompressible) bytes so proxy gzip
-# can't inflate the apparent ceiling. Capped at 8192 KiB raw.
-@mcp.tool(structured_output=False)
-def __debug_echo_base64(n_kib: int) -> dict[str, Any]:
-    """TEMPORARY: return a base64 blob of n_kib raw KiB plus its sha256, for transport sizing.
-
-    n_kib is RAW bytes before base64 (1 KiB = 1024 bytes); hard max 8192 (8 MiB raw).
-    Hash the decoded bytes on your side and after a Drive round-trip to confirm integrity.
-
-    Args:
-        n_kib: number of raw KiB to generate (1..8192)
-    """
-    if not isinstance(n_kib, int) or n_kib <= 0:
-        return {"code": "bad_request"}
-    if n_kib > 8192:
-        return {"code": "too_large", "max_kib": 8192}
-    raw = random.Random(1234).randbytes(n_kib * 1024)
-    return {
-        "ok": True,
-        "n_kib": n_kib,
-        "raw_bytes": len(raw),
-        "sha256": hashlib.sha256(raw).hexdigest(),
-        "data_base64": base64.b64encode(raw).decode("ascii"),
-    }
-
-
 # ── Homelab hardening: some media tools intentionally NOT registered ──────────
 # send_file and send_audio_message are omitted — they take server-local paths
 # that are meaningless over the remote MCP Server Portal transport.
 # The underlying whatsapp_send_file / whatsapp_audio_voice_message helpers remain
 # in whatsapp.py for potential future use but are unreachable via MCP.
 # download_media (image receive) and export_media (base64 export for piping to other
-# tools) ARE registered above. __debug_echo_base64 is a TEMPORARY transport probe to
-# be removed once the Cowork base64 ceiling is measured (Step 0).
+# tools, e.g. upload to Google Drive) ARE registered above.
 # Phase B (send images) is deferred — see the homelab plan.
 
 

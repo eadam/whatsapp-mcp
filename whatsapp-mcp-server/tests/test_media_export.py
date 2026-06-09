@@ -306,6 +306,6 @@ class TestToolRegistration:
 
         names = {t.name for t in main.mcp._tool_manager.list_tools()}
         assert "export_media" in names
-        # 11 base + export_media + __debug_echo_base64 probe (probe removed after Step 0 → 12)
-        assert "__debug_echo_base64" in names
-        assert len(names) == 13
+        # 11 base + export_media = 12 (the temporary __debug_echo_base64 probe was removed)
+        assert "__debug_echo_base64" not in names
+        assert len(names) == 12
